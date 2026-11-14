@@ -96,6 +96,19 @@ class SimpleBatchSampler(BatchSampler):
         self.epoch = epoch
 
 
+class VariableBatchSampler(BatchSampler):
+    def __init__(self):
+        self.batch_size = None
+        self.drop_last = False
+        self.sampler = range(8)
+
+    def __len__(self):
+        return 5
+
+    def __iter__(self):
+        yield from ([0, 1], [2, 3], [4], [5], [6, 7])
+
+
 class DataLoaderTester(AccelerateTestCase):
     def check_batch_sampler_shards(self, batch_sampler, expected, split_batches=False, even_batches=True):
         batch_sampler_shards = [
@@ -614,13 +627,51 @@ class DataLoaderTester(AccelerateTestCase):
         new_dataloader = skip_first_batches(dataloader, num_batches=2)
         assert [t.tolist() for t in new_dataloader] == [[8, 9, 10, 11], [12, 13, 14, 15]]
 
-    def test_skip_first_batches_preserves_batch_metadata(self):
-        dataloader = prepare_data_loader(DataLoader(range(10), batch_size=2), num_processes=2, process_index=0)
+    @parameterized.expand([False, True])
+    def test_skip_first_batches_preserves_batch_metadata(self, split_batches):
+        dataloader = prepare_data_loader(
+            DataLoader(range(10), batch_size=4), num_processes=2, process_index=0, split_batches=split_batches
+        )
+        assert dataloader.total_batch_size == (4 if split_batches else 8)
         resumed = skip_first_batches(dataloader, num_batches=1)
 
-        assert resumed.total_batch_size == 4
-        assert [batch.tolist() for batch in resumed] == [[4, 5], [8, 9]]
+        assert resumed.total_batch_size == (4 if split_batches else 8)
+        expected = [[4, 5], [8, 9]] if split_batches else [[8, 9, 0, 1]]
+        assert [batch.tolist() for batch in resumed] == expected
         assert resumed.remainder == 2
+
+    @parameterized.expand([0, 1])
+    def test_variable_batch_size_metadata(self, skip):
+        # Simulate two ranks without a process group, including an uneven final round.
+        expected = [[[0, 1], [4], [6, 7]], [[2, 3], [5]]]
+        for rank in range(2):
+            dataloader = prepare_data_loader(
+                DataLoader(range(8), batch_sampler=VariableBatchSampler()),
+                num_processes=2,
+                process_index=rank,
+                even_batches=False,
+            )
+            if skip:
+                dataloader = skip_first_batches(dataloader, skip)
+            assert dataloader.total_batch_size is None
+            assert len(dataloader) == len(expected[rank]) - skip
+            actual = []
+            for batch in dataloader:
+                assert dataloader.remainder == -1
+                actual.append(batch.tolist())
+            assert actual == expected[rank][skip:]
+
+    def test_variable_batch_size_gather_for_metrics(self):
+        accelerator = Accelerator(cpu=True)
+        dataloader = accelerator.prepare(DataLoader(range(8), batch_sampler=VariableBatchSampler()))
+        assert dataloader.total_batch_size is None
+        samples = []
+        for batch in dataloader:
+            assert dataloader.remainder == -1
+            gathered = accelerator.gather_for_metrics(batch)
+            torch.testing.assert_close(gathered, batch)
+            samples.extend(gathered.tolist())
+        assert samples == list(range(8))
 
     def test_skip_first_batches_preserves_drop_last(self):
         dataloader = prepare_data_loader(
